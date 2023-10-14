@@ -1,0 +1,137 @@
+#这个流程适用于，使用GATK对RNA-Seq数据进行variant calling
+#使用的数据是双端illumina测序数据
+#!/bin/bash
+#这个流程只适用与单样本，每一个样本只有一对illumina读数产生的PE fastq数据
+
+#工具路径
+star=/public/home/wulei/BioSoftware/STAR-2.7.10b/source/STAR
+gatk=/public/home/wulei/miniconda3/envs/gatk/share/gatk4-4.3.0.0-0/gatk
+
+#reference
+reference=/public2022/wulei/GRCh38/GRCh38.primary_assembly.genome.fa
+star_index=/public2022/wulei/GRCh38/star_idex/
+GATK_bundle=/public2022/wulei/GRCh38/GATK
+dbsnp=Homo_sapiens_assembly38.dbsnp138.vcf
+known_indels=Homo_sapiens_assembly38.known_indels.vcf.gz
+
+#从窗口中读取参数
+fq1=$1      #绝对路径
+fq2=$2      #绝对路径
+RGID=$3     #read group 单样品就用lane1代替
+PL=ILLUMINA #这个值不能乱写，只能是市面上有的，默认illumina
+RGLB=$4
+RGPU=$5
+sample=$6
+outdir=$7 #所有中间文件的输出目录,注意末尾不要加 /
+
+#创建一个输出目录
+outdir=${outdir}/${sample}_GATK
+
+#创建输出目录，这里输入的都是clean data，直接从比对开始进行
+if [ ! -d $outdir/star/star_1_out ]; then
+    mkdir -p $outdir/star/star_1_out
+fi
+if [ ! -d $outdir/star/star_2_out ]; then
+    mkdir -p $outdir/star/star_2_out
+fi
+if [ ! -d $outdir/gatk ]; then
+    mkdir -p $outdir/gatk
+fi
+
+#STAR进行比对,第一次比对
+time $star --runThreadN 12 \
+    --readFilesIn $fq1 $fq2 \
+    --readFilesCommand zcat \
+    --genomeDir $star_index \
+    --outSAMtype BAM SortedByCoordinate \
+    --outFileNamePrefix ${outdir}/star/star_1_out/${sample} \
+    --outSAMunmapped Within
+wait
+#第二次比对
+time $star --runThreadN 12 \
+    --readFilesIn $fq1 $fq2 \
+    --readFilesCommand zcat \
+    --genomeDir $star_index \
+    --sjdbFileChrStartEnd ${outdir}/star/star_1_out/${sample}SJ.out.tab \
+    --outSAMtype BAM SortedByCoordinate \
+    --outFileNamePrefix ${outdir}/star/star_2_out/${sample}
+wait
+
+#Markduplicates，这一步不需要建立索引
+time $gatk MarkDuplicates \
+    --INPUT ${outdir}/star/star_2_out/${sample}Aligned.sortedByCoord.out.bam \
+    --OUTPUT ${outdir}/gatk/${sample}.Markdup.bam \
+    --CREATE_INDEX true \
+    --VALIDATION_STRINGENCY SILENT \
+    --METRICS_FILE ${outdir}/gatk/${sample}.Markdup.metrics
+wait
+#SplitNCigarReads
+time $gatk SplitNCigarReads \
+    -R $reference \
+    -I ${outdir}/gatk/${sample}.Markdup.bam \
+    --create-output-bam-index true \
+    -O ${outdir}/gatk/${sample}.SplitN.bam
+wait
+#添加read group信息
+$gatk AddOrReplaceReadGroups \
+    -I ${outdir}/gatk/${sample}.SplitN.bam \
+    -O ${outdir}/gatk/${sample}.split.add.bam \
+    --CREATE_INDEX true \
+    -ID ${RGID} \
+    -LB ${RGLB} \
+    -PL ${PL} \
+    -PU ${RGPU} \
+    -SM ${sample}
+wait
+#BQSR
+time $gatk BaseRecalibrator \
+    -R ${reference} \
+    -I ${outdir}/gatk/${sample}.split.add.bam \
+    --use-original-qualities \
+    -O ${outdir}/gatk/${sample}.recal_data.csv \
+    --known-sites ${GATK_bundle}/${dbsnp} \
+    --known-sites ${GATK_bundle}/${known_indels}
+wait
+
+#apply BQSR
+time $gatk ApplyBQSR \
+    -R ${reference} \
+    -I ${outdir}/gatk/${sample}.split.add.bam \
+    --use-original-qualities \
+    -O ${outdir}/gatk/${sample}.sorted.BQSR.bam \
+    --bqsr-recal-file ${outdir}/gatk/${sample}.recal_data.csv
+#--add-output-sam-program-record  如果添加上去的话，会给bam文件添加一个头部信息。用于追踪bam文件经过怎样的处理
+wait
+#HaplotypeCaller
+mkdir ${outdir}/HC_out
+index=0
+for dir in /public2022/wulei/GRCh38/interval/new_interval/*/; do
+    echo $i
+    let index+=1
+    time $gatk HaplotypeCaller \
+        -R ${reference} \
+        -I ${outdir}/gatk/${sample}.sorted.BQSR.bam \
+        -L ${dir%?}/scattered.interval_list \
+        -O ${outdir}/HC_out/${sample}.HC.${index}.vcf.gz \
+        --recover-dangling-heads TRUE \
+        -dont-use-soft-clipped-bases \
+        --standard-min-confidence-threshold-for-calling 10 &
+done && wait
+
+#merge vcfs
+#用生成的vcf文件名拼接输入字段
+vcfs=""
+for z in ${outdir}/HC_out/*.vcf.gz; do
+    [[ -e "$z" ]] || break
+    vcfs="-I $z $vcfs"
+done
+wait
+time $gatk MergeVcfs ${vcfs} -O ${outdir}/HC_out/${sample}.HC.merge.vcf.gz && echo "** MergeVcfs done **"
+wait
+gunzip ${outdir}/HC_out/${sample}.HC.merge.vcf.gz
+time $gatk VariantFiltration \
+    -R ${reference} \
+    -V ${outdir}/HC_out/${sample}.HC.merge.vcf \
+    -filter "FS > 30.0" --filter-name "FS" \
+    -filter "QD < 2.0" --filter-name "QD" \
+    -O ${outdir}/HC_out/${sample}.HC.filter.vcf
